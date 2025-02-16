@@ -1,4 +1,5 @@
 import pandas as pd
+import itertools
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression, LogisticRegression
@@ -7,15 +8,13 @@ def dataProcessing():
     # Read both results files and transform into pandas dataframe
     qualificationResults = pd.read_csv("../scraper/qualiResults.csv", encoding="cp1252")
     raceResults = pd.read_csv("../scraper/raceResults.csv", encoding="cp1252")
+    startingGrid = pd.read_csv("../scraper/startingGrid.csv", encoding="cp1252")
     # Merge the two dataframes into one (matching where every driver qualified and finished
     # Drop the unnecessary column of car numbers
     mergedResults = (pd
-                     .merge(qualificationResults, raceResults, on=["Race", "Year", "Driver", "Car Number", "Team"], suffixes=(" Quali", " Race"))
-                     .drop("Car Number", axis=1))
-    # Fill Null Q2 results with Q1 times
-    mergedResults["Q2"] = mergedResults["Q2"].fillna(mergedResults["Q1"])
-    # Fill Null Q3 results with Q2 times
-    mergedResults["Q3"] = mergedResults["Q3"].fillna(mergedResults["Q2"])
+                     .merge(qualificationResults, raceResults, on=["Race", "Year", "Driver", "Car Number", "Team"], suffixes=(" Quali", " Race")))
+
+    mergedResults = pd.merge(mergedResults, startingGrid, on=["Race", "Year", "Driver", "Car Number", "Team"]).drop(["Car Number", "QTime"],axis=1)
 
     # Replace every NC (Not Classfied), DQ (disqualified), RT (Retired), EX (Excluded) position with 26 (lower than any
     # possible position
@@ -55,10 +54,10 @@ def dataProcessing():
                                       .cumsum() - mergedResults["Points"])
 
     # Create a new dataframe to store the average position for each driver for past 5 races
-    last5 = mergedResults[["Year", "Race Number", "Driver", "Position Race"]].copy()
+    last5 = mergedResults[["Year", "Race Number", "Driver", "Position Race", "Season Points", "Team Season DNF"]].copy()
     last5 = last5.sort_values(by=["Driver", "Year", "Race Number"])
 
-    # Create new column to hold the average
+    # Create new column to hold the average race position
     last5["Last 5 Race"] = (last5.groupby("Driver")["Position Race"]
                             # Create rolling window of size 6 excluding current row (so window of size 5)
                             .rolling(window=6, min_periods=1, closed="left")
@@ -67,10 +66,34 @@ def dataProcessing():
                             .fillna(0)
                             .reset_index(level=0, drop=True))
 
+    # Create new column to hold the average race points
+    last5["Last 5 Points"] = (last5.groupby(["Driver", "Year"])["Season Points"]
+                              # Create rolling window of size 6 excluding current row (so window of size 5)
+                              .rolling(window=5, min_periods=1)
+                              .apply(lambda x: x.iloc[-1] - x.iloc[0], raw=False)
+                              # Fill the first entry with 0 (as no mean here because row is excluded)
+                              .fillna(0)
+                              .reset_index(level=[0, 1], drop=True))
+
+    # Create new column to hold the average team DNFs
+    last5["Last 5 DNF"] = (last5.groupby(["Driver", "Year"])["Team Season DNF"]
+                              # Create rolling window of size 6 excluding current row (so window of size 5)
+                              .rolling(window=5, min_periods=1)
+                              .apply(lambda x: x.iloc[-1] - x.iloc[0], raw=False)
+                              # Fill the first entry with 0 (as no mean here because row is excluded)
+                              .fillna(0)
+                              .reset_index(level=[0, 1], drop=True))
+
     # Drop unnecessary columns
-    last5 = last5.drop(["Position Race", "Year"], axis=1)
+    print(last5.head(50))
+    last5 = last5.drop(["Position Race", "Year", "Season Points", "Team Season DNF"], axis=1)
 
     mergedResults = mergedResults.merge(last5, on=["Driver", "Race Number"])
+
+    # Fill Null Q2 results with Q1 times
+    mergedResults["Q2"] = mergedResults["Q2"].fillna(mergedResults["Q1"])
+    # Fill Null Q3 results with Q2 times
+    mergedResults["Q3"] = mergedResults["Q3"].fillna(mergedResults["Q2"])
 
     # Loop over Q1, Q2, and Q3
     for i in range(1,4):
@@ -97,6 +120,21 @@ def dataProcessing():
     # qualification fastest time
     mergedResults["Quali Delta"] = mergedResults["Fastest Individual Time"] - mergedResults["Fastest Quali Time"]
 
+    # Create a new column that holds each driver's position in the WDC standings
+    mergedResults["WDC"] = mergedResults.groupby("Year").apply(
+        lambda season: season.groupby("Race")["Season Points"].rank(ascending=False, method="first")
+    ).reset_index(drop=True)
+
+    # Create a new dataframe to store the total amount of points for each team per race
+    teamPoints = mergedResults.groupby(["Year", "Race Number", "Team"]).agg({"Season Points": "sum"})
+
+    # Create a new column that holds each team's position in the WCC standings
+    teamPoints["WCC"] = teamPoints.groupby("Race Number")["Season Points"].rank(ascending=False, method="first")
+    print(teamPoints.head(50))
+
+    # Merge this data with existing dataframe
+    mergedResults = mergedResults.merge(teamPoints, on=["Race Number", "Team"], suffixes=("", " Team"))
+
     # Drop unnecessary columns
     mergedResults = mergedResults.drop(["Q1", "Q2", "Time", "Laps Quali", "Laps Race"], axis=1)
 
@@ -105,7 +143,7 @@ def dataProcessing():
 
     # Normalise data
     scaler = StandardScaler()
-    mergedResults[["Quali Delta"]] = scaler.fit_transform(mergedResults[["Quali Delta"]])
+    mergedResults[["Quali Delta", "Last 5 Points"]] = scaler.fit_transform(mergedResults[["Quali Delta", "Last 5 Points"]])
     print(mergedResults.head(50))
     # One-hot encode categorical data like driver names, team names, and race location
     mergedResults = pd.get_dummies(mergedResults, columns=["Driver", "Team", "Race"], drop_first=True)
@@ -189,10 +227,13 @@ teamDict = {
 
 # Helper function to find all input columns for model training (especially one-hot encoded ones)
 def findInputColumns(df):
-    inputColumns = ["Position Quali", "Last 5 Race", "Quali Delta", "Team Season DNF"]
+    #inputColumns = ["Position Quali", "Last 5 Race", "Quali Delta", "Team Season DNF", "Last 5 DNF", "SPosition"]
+    inputColumns = ["Position Quali", "SPosition", "Team Season DNF",  "Last 5 Race", "Last 5 Points", "Last 5 DNF", "Quali Delta", "WDC", "WCC"]
     for column in df.columns:
         if column.startswith("Driver_") or column.startswith("Team_") or column.startswith("Race_"):
             inputColumns.append(column)
+    # inputColumns = df.columns
+    # inputColumns.drop(["Year", "Q3", "Position Race", "Points", "Win", "Race DNF", "Race Number", "Season Points", "Fastest Individual Time", "Fastest Quali Time"])
     return inputColumns
 
 # Helper function to find amount of correctly predicted wins for a regression model
@@ -225,7 +266,7 @@ def randomForest(train, test, inputColumns):
 # Function that trains a linear regression model
 def linearRegression(train, test, inputColumns):
     # Train model
-    model = LinearRegression(fit_intercept=True, n_jobs=-1)
+    model = LinearRegression(fit_intercept=False, n_jobs=-1)
     model.fit(train[inputColumns], train["Position Race"])
     # Make predictions on testing set
     predictions = model.predict(test[inputColumns])
